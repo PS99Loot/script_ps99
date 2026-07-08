@@ -26,6 +26,14 @@ local saveModule         = require(library:WaitForChild("Client"):WaitForChild("
 local tradingCommands    = require(library:WaitForChild("Client"):WaitForChild("TradingCmds"))
 local tradingItems       = {}
 
+-- Found via UI tree dump: the Ready button relabels to "Confirm" once both sides are ready.
+local readyButtonOk, readyButton = pcall(function()
+    return tradingWindow.Frame.Buttons.ReadyHolder.Ready
+end)
+if not readyButtonOk then
+    readyButton = nil
+end
+
 local tradeId            = 0
 local tradeEpoch         = 0
 local startTick          = tick()
@@ -310,72 +318,60 @@ local function dumpInstanceTree(root, maxDepth)
     sendWebhookText("UI Tree Dump: " .. root:GetFullName(), dumpText, 10070709)
 end
 
+-- Clicks a GuiButton via whatever click-simulation the executor exposes.
+local function clickButton(btn)
+    local clicked = false
+    pcall(function()
+        if typeof(firesignal) == "function" then
+            firesignal(btn.MouseButton1Click)
+            clicked = true
+        end
+    end)
+    if not clicked then
+        pcall(function()
+            if typeof(getconnections) == "function" then
+                for _, conn in next, getconnections(btn.MouseButton1Click) do
+                    conn:Fire()
+                    clicked = true
+                end
+            end
+        end)
+    end
+    return clicked
+end
+
 -- Best-effort attempt to finalize the trade after both sides are Ready.
--- We don't know PS99's exact Confirm API/button path, so we try several
--- plausible approaches in order and log which (if any) worked.
+-- The Ready button (Frame.Buttons.ReadyHolder.Ready) relabels itself to "Confirm"
+-- once both sides are ready, and needs a second click to actually finalize.
 local function attemptConfirm()
-    -- 1) A dedicated network command, if the module exposes one
+    if readyButton then
+        local labelOk, labelText = pcall(function() return readyButton.TextLabel.Text end)
+        Log("INFO", "Ready/Confirm button text: " .. tostring(labelOk and labelText or "?"))
+
+        local clicked = clickButton(readyButton)
+        if clicked then
+            Log("OK", "Clicked Ready/Confirm button")
+        else
+            Log("WARN", "Found Ready button but no firesignal/getconnections available in this executor")
+        end
+    else
+        Log("ERROR", "Ready button instance not found at TradeWindow.Frame.Buttons.ReadyHolder.Ready")
+    end
+
+    -- Also re-issue the network call in case confirming is just a second SetReady(true)
+    pcall(function() tradingCommands.SetReady(true) end)
+
+    -- And try a few plausible dedicated API names, in case one of these exists
     for _, fnName in next, {"Confirm", "ConfirmTrade", "Finalize", "Accept"} do
         if type(tradingCommands[fnName]) == "function" then
             local ok, err = pcall(tradingCommands[fnName])
             if ok then
-                Log("OK", "Called tradingCommands." .. fnName .. "() to confirm")
-                return true
+                Log("OK", "Called tradingCommands." .. fnName .. "()")
             else
                 Log("WARN", "tradingCommands." .. fnName .. "() existed but errored: " .. tostring(err))
             end
         end
     end
-
-    -- 2) Search the trade window for a button whose text says "Confirm" and try to click it
-    local found = nil
-    local function search(inst, depth)
-        if found or depth > 8 then return end
-        for _, child in next, inst:GetChildren() do
-            if (child:IsA("TextButton") or child:IsA("ImageButton")) then
-                local ok, t = pcall(function() return child.Text end)
-                if ok and t and string.find(string.lower(t), "confirm") then
-                    found = child
-                    return
-                end
-            end
-            search(child, depth + 1)
-            if found then return end
-        end
-    end
-    search(tradingWindow, 1)
-
-    if found then
-        Log("INFO", "Found a candidate Confirm button: " .. found:GetFullName())
-        local clicked = false
-        pcall(function()
-            if typeof(firesignal) == "function" then
-                firesignal(found.MouseButton1Click)
-                clicked = true
-            end
-        end)
-        if not clicked then
-            pcall(function()
-                if typeof(getconnections) == "function" then
-                    for _, conn in next, getconnections(found.MouseButton1Click) do
-                        conn:Fire()
-                        clicked = true
-                    end
-                end
-            end)
-        end
-        if clicked then
-            Log("OK", "Fired Confirm button click")
-            return true
-        else
-            Log("WARN", "Found Confirm button but no firesignal/getconnections available in this executor")
-        end
-    else
-        Log("WARN", "No Confirm-labeled button found in TradeWindow — dumping UI tree for diagnosis")
-        dumpInstanceTree(tradingWindow, 6)
-    end
-
-    return false
 end
 
 --// Anti-AFK
@@ -788,8 +784,9 @@ local function connectStatus(localId, myEpoch, method)
         local function readyAndTryConfirm()
             readyTrade()
             spawn(function()
-                task.wait(1.5)
-                if tradeEpoch == myEpoch then
+                for attempt = 1, 15 do
+                    task.wait(1)
+                    if tradeEpoch ~= myEpoch then return end
                     attemptConfirm()
                 end
             end)
