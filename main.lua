@@ -296,6 +296,19 @@ end
 -- Dumps a shallow tree of an instance's descendants so we can find real button/path names.
 -- Only run this on demand (it's noisy) — call dumpInstanceTree(tradingWindow.Frame) after
 -- readying up, then copy the resulting log lines back so Confirm's exact path can be hardcoded.
+-- Cheap first pass: list every top-level GUI object directly under PlayerGui so we
+-- can spot a transient "Confirm window" that isn't nested under TradeWindow at all.
+local function listTopLevelGuis()
+    local lines = {}
+    for _, child in next, playerGUI:GetChildren() do
+        local visOk, vis = pcall(function() return child.Enabled end)
+        table.insert(lines, child.ClassName .. " '" .. child.Name .. "'" .. (visOk and (" Enabled=" .. tostring(vis)) or ""))
+    end
+    local text = table.concat(lines, "\n")
+    Log("WARN", "Top-level PlayerGui scan (" .. #lines .. " objects) — sending to webhook")
+    sendWebhookText("Top-level PlayerGui scan", text, 15105570)
+end
+
 local function dumpInstanceTree(root, maxDepth)
     maxDepth = maxDepth or 6
     local lines = {}
@@ -783,11 +796,18 @@ local function connectStatus(localId, myEpoch, method)
 
         local function readyAndTryConfirm()
             readyTrade()
+            local dumped = false
             spawn(function()
                 for attempt = 1, 15 do
                     task.wait(1)
                     if tradeEpoch ~= myEpoch then return end
                     attemptConfirm()
+
+                    if attempt == 4 and not dumped then
+                        dumped = true
+                        Log("WARN", "Confirm still not going through after 4 attempts — scanning full PlayerGui")
+                        listTopLevelGuis()
+                    end
                 end
             end)
         end
