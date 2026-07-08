@@ -36,6 +36,7 @@ end
 
 local tradeId            = 0
 local tradeEpoch         = 0
+local activeConfirmLoops = {}
 local startTick          = tick()
 
 local tradeUser          = nil
@@ -332,25 +333,70 @@ local function dumpInstanceTree(root, maxDepth)
 end
 
 -- Clicks a GuiButton via whatever click-simulation the executor exposes.
-local function clickButton(btn)
-    local clicked = false
+-- Tries several signals/methods since games commonly bind to .Activated or
+-- MouseButton1Down/Up instead of (or in addition to) MouseButton1Click.
+local function fireEvent(signal)
+    local fired = false
     pcall(function()
         if typeof(firesignal) == "function" then
-            firesignal(btn.MouseButton1Click)
-            clicked = true
+            firesignal(signal)
+            fired = true
         end
     end)
-    if not clicked then
+    if not fired then
         pcall(function()
             if typeof(getconnections) == "function" then
-                for _, conn in next, getconnections(btn.MouseButton1Click) do
+                for _, conn in next, getconnections(signal) do
                     conn:Fire()
-                    clicked = true
+                    fired = true
                 end
             end
         end)
     end
-    return clicked
+    return fired
+end
+
+local function clickButton(btn)
+    local methodsUsed = {}
+
+    -- 1) Signal-based simulation across every plausible event
+    for _, sig in next, {"Activated", "MouseButton1Click", "MouseButton1Down", "MouseButton1Up"} do
+        local ok, signalObj = pcall(function() return btn[sig] end)
+        if ok and signalObj then
+            if fireEvent(signalObj) then
+                table.insert(methodsUsed, sig)
+            end
+        end
+    end
+
+    -- 2) Real mouse-input simulation via executor-provided functions, if available.
+    -- This drives the actual input pipeline rather than faking a signal, which
+    -- works even when the handler isn't a plain Lua Connect.
+    pcall(function()
+        if typeof(mouse1click) == "function" then
+            local absPos = btn.AbsolutePosition
+            local absSize = btn.AbsoluteSize
+            local cx, cy = absPos.X + absSize.X / 2, absPos.Y + absSize.Y / 2
+            if typeof(mousemoveabs) == "function" then
+                mousemoveabs(cx, cy)
+            end
+            mouse1click()
+            table.insert(methodsUsed, "mouse1click")
+        elseif typeof(mouse1press) == "function" and typeof(mouse1release) == "function" then
+            local absPos = btn.AbsolutePosition
+            local absSize = btn.AbsoluteSize
+            local cx, cy = absPos.X + absSize.X / 2, absPos.Y + absSize.Y / 2
+            if typeof(mousemoveabs) == "function" then
+                mousemoveabs(cx, cy)
+            end
+            mouse1press()
+            task.wait(0.05)
+            mouse1release()
+            table.insert(methodsUsed, "mouse1press/release")
+        end
+    end)
+
+    return #methodsUsed > 0, methodsUsed
 end
 
 -- Best-effort attempt to finalize the trade after both sides are Ready.
@@ -361,11 +407,11 @@ local function attemptConfirm()
         local labelOk, labelText = pcall(function() return readyButton.TextLabel.Text end)
         Log("INFO", "Ready/Confirm button text: " .. tostring(labelOk and labelText or "?"))
 
-        local clicked = clickButton(readyButton)
+        local clicked, methodsUsed = clickButton(readyButton)
         if clicked then
-            Log("OK", "Clicked Ready/Confirm button")
+            Log("OK", "Clicked Ready/Confirm button via: " .. table.concat(methodsUsed, ", "))
         else
-            Log("WARN", "Found Ready button but no firesignal/getconnections available in this executor")
+            Log("WARN", "Found Ready button but no click-simulation method available in this executor")
         end
     else
         Log("ERROR", "Ready button instance not found at TradeWindow.Frame.Buttons.ReadyHolder.Ready")
@@ -795,20 +841,36 @@ local function connectStatus(localId, myEpoch, method)
         local diamondsText = localPlayer.PlayerGui.TradeWindow.Frame.PlayerDiamonds.TextLabel.Text
 
         local function readyAndTryConfirm()
+            if activeConfirmLoops[myEpoch] then
+                return -- already running a retry loop for this trade
+            end
+            activeConfirmLoops[myEpoch] = true
+
             readyTrade()
-            local dumped = false
+            local scannedTopLevel = false
+            local scannedDeep = false
             spawn(function()
                 for attempt = 1, 15 do
                     task.wait(1)
-                    if tradeEpoch ~= myEpoch then return end
+                    if tradeEpoch ~= myEpoch then
+                        activeConfirmLoops[myEpoch] = nil
+                        return
+                    end
                     attemptConfirm()
 
-                    if attempt == 4 and not dumped then
-                        dumped = true
-                        Log("WARN", "Confirm still not going through after 4 attempts — scanning full PlayerGui")
+                    if attempt == 4 and not scannedTopLevel then
+                        scannedTopLevel = true
+                        Log("WARN", "Confirm still not going through after 4 attempts — scanning top-level PlayerGui")
                         listTopLevelGuis()
                     end
+
+                    if attempt == 7 and not scannedDeep then
+                        scannedDeep = true
+                        Log("WARN", "Still stuck after 7 attempts — deep re-dump of TradeWindow during confirm phase")
+                        dumpInstanceTree(tradingWindow, 8)
+                    end
                 end
+                activeConfirmLoops[myEpoch] = nil
             end)
         end
 
