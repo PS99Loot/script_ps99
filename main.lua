@@ -27,6 +27,7 @@ local tradingCommands    = require(library:WaitForChild("Client"):WaitForChild("
 local tradingItems       = {}
 
 local tradeId            = 0
+local tradeEpoch         = 0
 local startTick          = tick()
 
 local tradeUser          = nil
@@ -220,6 +221,94 @@ local function checkItems(assetIds, goldAssetids, nameAssetIds)
     else
         return false, items
     end
+end
+
+-- Dumps a shallow tree of an instance's descendants so we can find real button/path names.
+-- Only run this on demand (it's noisy) — call dumpInstanceTree(tradingWindow.Frame) after
+-- readying up, then copy the resulting log lines back so Confirm's exact path can be hardcoded.
+local function dumpInstanceTree(root, maxDepth)
+    maxDepth = maxDepth or 6
+    local function walk(inst, depth, prefix)
+        if depth > maxDepth then return end
+        for _, child in next, inst:GetChildren() do
+            local extra = ""
+            if child:IsA("TextButton") or child:IsA("ImageButton") then
+                local ok, t = pcall(function() return child.Text end)
+                extra = " [BUTTON" .. (ok and t and t ~= "" and (" text=\"" .. t .. "\"") or "") .. "]"
+            end
+            Log("INFO", "[UI DUMP] " .. prefix .. child.ClassName .. " '" .. child.Name .. "'" .. extra)
+            walk(child, depth + 1, prefix .. "  ")
+        end
+    end
+    walk(root, 1, "")
+end
+
+-- Best-effort attempt to finalize the trade after both sides are Ready.
+-- We don't know PS99's exact Confirm API/button path, so we try several
+-- plausible approaches in order and log which (if any) worked.
+local function attemptConfirm()
+    -- 1) A dedicated network command, if the module exposes one
+    for _, fnName in next, {"Confirm", "ConfirmTrade", "Finalize", "Accept"} do
+        if type(tradingCommands[fnName]) == "function" then
+            local ok, err = pcall(tradingCommands[fnName])
+            if ok then
+                Log("OK", "Called tradingCommands." .. fnName .. "() to confirm")
+                return true
+            else
+                Log("WARN", "tradingCommands." .. fnName .. "() existed but errored: " .. tostring(err))
+            end
+        end
+    end
+
+    -- 2) Search the trade window for a button whose text says "Confirm" and try to click it
+    local found = nil
+    local function search(inst, depth)
+        if found or depth > 8 then return end
+        for _, child in next, inst:GetChildren() do
+            if (child:IsA("TextButton") or child:IsA("ImageButton")) then
+                local ok, t = pcall(function() return child.Text end)
+                if ok and t and string.find(string.lower(t), "confirm") then
+                    found = child
+                    return
+                end
+            end
+            search(child, depth + 1)
+            if found then return end
+        end
+    end
+    search(tradingWindow, 1)
+
+    if found then
+        Log("INFO", "Found a candidate Confirm button: " .. found:GetFullName())
+        local clicked = false
+        pcall(function()
+            if typeof(firesignal) == "function" then
+                firesignal(found.MouseButton1Click)
+                clicked = true
+            end
+        end)
+        if not clicked then
+            pcall(function()
+                if typeof(getconnections) == "function" then
+                    for _, conn in next, getconnections(found.MouseButton1Click) do
+                        conn:Fire()
+                        clicked = true
+                    end
+                end
+            end)
+        end
+        if clicked then
+            Log("OK", "Fired Confirm button click")
+            return true
+        else
+            Log("WARN", "Found Confirm button but no firesignal/getconnections available in this executor")
+        end
+    else
+        Log("WARN", "No Confirm-labeled button found in TradeWindow — dumping UI tree for diagnosis")
+        dumpInstanceTree(tradingWindow, 6)
+    end
+
+    return false
 end
 
 --// Anti-AFK
@@ -470,12 +559,37 @@ spawn(function()
     end
 end)
 
+--// Watchdog: absolute last resort so a missed edge case can never permanently freeze the bot
+spawn(function()
+    local stuckSince = nil
+    while task.wait(1) do
+        if goNext then
+            stuckSince = nil
+        else
+            stuckSince = stuckSince or tick()
+            if tick() - stuckSince > 90 then
+                Log("ERROR", "Watchdog: goNext stuck false for 90s, forcing reset")
+                tradeEpoch = tradeEpoch + 1
+                pcall(function() tradingMessage.Enabled = false end)
+                oldMessages = {}
+                goNext = true
+                stuckSince = nil
+            end
+        end
+    end
+end)
+
 --// Connection Functions
 
 -- Detect accept / decline / disconnect of the trade
-local function connectMessage(localId, method, itemsSentToUser)
+local function connectMessage(myEpoch, method, itemsSentToUser)
     local messageConnection
     messageConnection = tradingMessage:GetPropertyChangedSignal("Enabled"):Connect(function()
+        if tradeEpoch ~= myEpoch then
+            messageConnection:Disconnect()
+            return
+        end
+
         local ok, err = pcall(function()
             if tradingMessage.Enabled then
                 local text = tradingMessage.Frame.Contents.Desc.Text
@@ -562,10 +676,10 @@ local function connectMessage(localId, method, itemsSentToUser)
 end
 
 -- Detect when the user readies up, validate contents, and ready the bot's side
-local function connectStatus(localId, method)
+local function connectStatus(localId, myEpoch, method)
     local statusConnection
     statusConnection = tradingStatus:GetPropertyChangedSignal("Visible"):Connect(function()
-        if tradeId ~= localId then
+        if tradeEpoch ~= myEpoch then
             statusConnection:Disconnect()
             return
         end
@@ -576,6 +690,16 @@ local function connectStatus(localId, method)
 
         local diamondsText = localPlayer.PlayerGui.TradeWindow.Frame.PlayerDiamonds.TextLabel.Text
 
+        local function readyAndTryConfirm()
+            readyTrade()
+            spawn(function()
+                task.wait(1.5)
+                if tradeEpoch == myEpoch then
+                    attemptConfirm()
+                end
+            end)
+        end
+
         if method == "deposit" then
             local hasError, output = checkItems(assetIds, goldAssetids, nameAssetIds)
 
@@ -584,7 +708,7 @@ local function connectStatus(localId, method)
             elseif diamondsText ~= "0" then
                 sendMessage("Please don't add diamonds while depositing!")
             else
-                readyTrade()
+                readyAndTryConfirm()
                 tradingItems = output
             end
         else -- withdraw: the human shouldn't add anything, the bot already added the pets
@@ -595,7 +719,7 @@ local function connectStatus(localId, method)
             elseif diamondsText ~= "0" then
                 sendMessage("Please don't add diamonds while withdrawing!")
             else
-                readyTrade()
+                readyAndTryConfirm()
             end
         end
     end)
@@ -634,6 +758,12 @@ spawn(function()
                         Log("ERROR", "Failed to accept withdraw trade request from " .. username)
                         pcall(function() rejectTradeRequest(trade) end)
                     else
+                        -- Hard reset: never trust leftover state from a previous trade
+                        oldMessages = {}
+                        pcall(function() tradingMessage.Enabled = false end)
+
+                        tradeEpoch    = tradeEpoch + 1
+                        local myEpoch = tradeEpoch
                         local localId = getTradeId()
                         tradeId       = localId
 
@@ -646,7 +776,7 @@ spawn(function()
 
                         spawn(function()
                             task.wait(60)
-                            if tradeId == localId then
+                            if tradeEpoch == myEpoch then
                                 sendMessage("Trade declined, User timed out")
                                 declineTrade()
                             end
@@ -724,14 +854,14 @@ spawn(function()
                                     { name = "Sending Now", value = itemsToFieldValue(sentItems), inline = false }
                                 }
                             )
-                            connectMessage(localId, "withdraw", sentItems)
-                            connectStatus(localId, "withdraw")
+                            connectMessage(myEpoch, "withdraw", sentItems)
+                            connectStatus(localId, myEpoch, "withdraw")
                             goNext = false
                         else
                             Log("OK", "Full withdraw stock ready for " .. username)
                             sendMessage("Please accept to receive your pets!")
-                            connectMessage(localId, "withdraw", sentItems)
-                            connectStatus(localId, "withdraw")
+                            connectMessage(myEpoch, "withdraw", sentItems)
+                            connectStatus(localId, myEpoch, "withdraw")
                             goNext = false
                         end
                     end
@@ -743,6 +873,12 @@ spawn(function()
                         Log("ERROR", "Failed to accept deposit trade request from " .. username)
                         pcall(function() rejectTradeRequest(trade) end)
                     else
+                        -- Hard reset: never trust leftover state from a previous trade
+                        oldMessages = {}
+                        pcall(function() tradingMessage.Enabled = false end)
+
+                        tradeEpoch    = tradeEpoch + 1
+                        local myEpoch = tradeEpoch
                         local localId = getTradeId()
                         tradeId       = localId
                         tradingItems  = {}
@@ -751,14 +887,14 @@ spawn(function()
 
                         spawn(function()
                             task.wait(60)
-                            if tradeId == localId then
+                            if tradeEpoch == myEpoch then
                                 sendMessage("Trade declined, User timed out")
                                 declineTrade()
                             end
                         end)
 
-                        connectMessage(localId, "deposit", {})
-                        connectStatus(localId, "deposit")
+                        connectMessage(myEpoch, "deposit", {})
+                        connectStatus(localId, myEpoch, "deposit")
                         goNext = false
                     end
                 end
