@@ -51,7 +51,10 @@ local Log -- forward declared, assigned after UI is built
 
 --// Webhook helper
 local function sendWebhook(title, description, color, fields)
-    if not request then return end
+    if not request then
+        Log("ERROR", "No request/http_request function available in this executor — webhooks are disabled")
+        return
+    end
 
     local embed = {
         ["title"]       = title,
@@ -473,61 +476,87 @@ end)
 local function connectMessage(localId, method, itemsSentToUser)
     local messageConnection
     messageConnection = tradingMessage:GetPropertyChangedSignal("Enabled"):Connect(function()
-        if tradingMessage.Enabled then
-            local text = tradingMessage.Frame.Contents.Desc.Text
+        local ok, err = pcall(function()
+            if tradingMessage.Enabled then
+                local text = tradingMessage.Frame.Contents.Desc.Text
+                Log("INFO", "Trade message shown: " .. tostring(text))
 
-            if text == "✅ Trade successfully completed!" then
-                sendMessage("Trade Completed!")
+                local lower = string.lower(tostring(text))
 
-                if method == "deposit" then
-                    sendWebhook(
-                        "Deposit Completed",
-                        "A deposit trade was completed.",
-                        3066993,
-                        {
-                            { name = "User", value = tostring(tradeUsername) .. " (" .. tostring(tradeUser) .. ")", inline = false },
-                            { name = "Items Deposited", value = itemsToFieldValue(tradingItems), inline = false }
-                        }
-                    )
-                else -- withdraw
-                    sendWebhook(
-                        "Withdraw Completed",
-                        "A withdraw trade was completed.",
-                        15158332,
-                        {
-                            { name = "User", value = tostring(tradeUsername) .. " (" .. tostring(tradeUser) .. ")", inline = false },
-                            { name = "Items Withdrawn", value = itemsToFieldValue(itemsSentToUser), inline = false }
-                        }
-                    )
+                if string.find(lower, "completed") then
+                    sendMessage("Trade Completed!")
 
-                    -- Clear the fulfilled withdraw so it can't be claimed twice
-                    if tradeUser then
-                        PendingWithdraws[tradeUser] = nil
+                    if method == "deposit" then
+                        Stats.depositsCompleted = Stats.depositsCompleted + 1
+                        sendWebhook(
+                            "Deposit Completed",
+                            "A deposit trade was completed.",
+                            3066993,
+                            {
+                                { name = "User", value = tostring(tradeUsername) .. " (" .. tostring(tradeUser) .. ")", inline = false },
+                                { name = "Items Deposited", value = itemsToFieldValue(tradingItems), inline = false }
+                            }
+                        )
+                    else -- withdraw
+                        Stats.withdrawsCompleted = Stats.withdrawsCompleted + 1
+                        sendWebhook(
+                            "Withdraw Completed",
+                            "A withdraw trade was completed.",
+                            15158332,
+                            {
+                                { name = "User", value = tostring(tradeUsername) .. " (" .. tostring(tradeUser) .. ")", inline = false },
+                                { name = "Items Withdrawn", value = itemsToFieldValue(itemsSentToUser), inline = false }
+                            }
+                        )
+
+                        -- Clear the fulfilled withdraw so it can't be claimed twice
+                        if tradeUser then
+                            PendingWithdraws[tradeUser] = nil
+                        end
                     end
+
+                    Log("OK", "Trade with " .. tostring(tradeUsername) .. " completed (" .. method .. ")")
+                    messageConnection:Disconnect()
+                    task.wait(1)
+                    tradingMessage.Enabled = false
+                    goNext = true
+
+                elseif string.find(lower, "cancelled") or string.find(lower, "canceled") or string.find(lower, "declined") then
+                    Log("WARN", "Trade with " .. tostring(tradeUsername) .. " was cancelled/declined")
+                    sendMessage("Trade Declined")
+                    messageConnection:Disconnect()
+                    task.wait(1)
+                    tradingMessage.Enabled = false
+                    goNext = true
+
+                elseif string.find(lower, "left the game") then
+                    Log("WARN", tostring(tradeUsername) .. " left the game mid-trade")
+                    sendMessage("Trade Declined")
+                    messageConnection:Disconnect()
+                    task.wait(1)
+                    tradingMessage.Enabled = false
+                    goNext = true
+
+                else
+                    -- Unknown popup text: log it (so we can add a proper case for it)
+                    -- and close it anyway so the bot never gets permanently stuck.
+                    Log("WARN", "Unrecognized trade message, closing anyway: " .. tostring(text))
+                    messageConnection:Disconnect()
+                    task.wait(1)
+                    tradingMessage.Enabled = false
+                    goNext = true
                 end
-
-                messageConnection:Disconnect()
-                task.wait(1)
-                tradingMessage.Enabled = false
+            else
                 goNext = true
-
-            elseif string.find(text, " cancelled the trade!") then
-                sendMessage("Trade Declined")
                 messageConnection:Disconnect()
-                task.wait(1)
-                tradingMessage.Enabled = false
-                goNext = true
-
-            elseif string.find(text, "left the game") then
-                sendMessage("Trade Declined")
-                messageConnection:Disconnect()
-                task.wait(1)
-                tradingMessage.Enabled = false
-                goNext = true
             end
-        else
+        end)
+
+        if not ok then
+            Log("ERROR", "connectMessage handler errored: " .. tostring(err))
             goNext = true
-            messageConnection:Disconnect()
+            pcall(function() messageConnection:Disconnect() end)
+            pcall(function() tradingMessage.Enabled = false end)
         end
     end)
 end
@@ -699,6 +728,7 @@ spawn(function()
                             connectStatus(localId, "withdraw")
                             goNext = false
                         else
+                            Log("OK", "Full withdraw stock ready for " .. username)
                             sendMessage("Please accept to receive your pets!")
                             connectMessage(localId, "withdraw", sentItems)
                             connectStatus(localId, "withdraw")
@@ -707,8 +737,10 @@ spawn(function()
                     end
                 else
                     -- DEPOSIT (default when there's no pending withdraw for this user)
+                    Log("INFO", username .. " has no pending withdraw, accepting as DEPOSIT")
                     local accepted = acceptTradeRequest(trade)
                     if not accepted then
+                        Log("ERROR", "Failed to accept deposit trade request from " .. username)
                         pcall(function() rejectTradeRequest(trade) end)
                     else
                         local localId = getTradeId()
