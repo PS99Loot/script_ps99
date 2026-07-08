@@ -801,6 +801,40 @@ local function connectMessage(myEpoch, method, itemsSentToUser)
                     tradingMessage.Enabled = false
                     goNext = true
 
+                elseif string.find(lower, "are you sure") or string.find(lower, "trade is fair") then
+                    Log("INFO", "Confirmation dialog detected — looking for a Yes button")
+                    local yesBtn = nil
+                    local function search(inst, depth)
+                        if yesBtn or depth > 8 then return end
+                        for _, child in next, inst:GetChildren() do
+                            if child:IsA("TextButton") or child:IsA("ImageButton") then
+                                local okT, t = pcall(function() return child.Text end)
+                                if okT and t and string.find(string.lower(t), "yes") then
+                                    yesBtn = child
+                                    return
+                                end
+                            end
+                            search(child, depth + 1)
+                            if yesBtn then return end
+                        end
+                    end
+                    search(tradingMessage, 1)
+
+                    if yesBtn then
+                        local yesClicked, yesMethods = clickButton(yesBtn)
+                        if yesClicked then
+                            Log("OK", "Clicked Yes button via: " .. table.concat(yesMethods, ", "))
+                        else
+                            Log("WARN", "Found Yes button but no click-simulation method worked")
+                        end
+                    else
+                        Log("WARN", "No Yes button found in confirmation dialog — dumping Message tree")
+                        dumpInstanceTree(tradingMessage, 8)
+                    end
+                    -- Deliberately do NOT disconnect/close here: we need to keep
+                    -- listening on this same connection for whatever popup comes next
+                    -- (either the real completion message or another prompt).
+
                 else
                     -- Unknown popup text: log it (so we can add a proper case for it)
                     -- and close it anyway so the bot never gets permanently stuck.
