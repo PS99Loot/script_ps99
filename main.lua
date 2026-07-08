@@ -890,6 +890,18 @@ local function connectStatus(localId, myEpoch, method)
                         activeConfirmLoops[myEpoch] = nil
                         return
                     end
+
+                    -- Check the button's current label before touching it again.
+                    -- Once it's confirmed, the button flips to something like
+                    -- "Unconfirm" — clicking that again would undo the confirm.
+                    local labelOk, labelText = pcall(function() return readyButton and readyButton.TextLabel.Text end)
+                    if labelOk and labelText and not string.find(string.lower(labelText), "^confirm!?$") and string.find(string.lower(labelText), "confirm") then
+                        -- text contains "confirm" but isn't exactly "Confirm"/"Confirm!" (e.g. "Unconfirm")
+                        Log("OK", "Button now reads \"" .. labelText .. "\" — treating as already confirmed, stopping clicks")
+                        activeConfirmLoops[myEpoch] = nil
+                        return
+                    end
+
                     attemptConfirm()
 
                     if attempt == 4 and not scannedTopLevel then
