@@ -49,6 +49,8 @@ local Stats = {
 --// UI (built below, functions defined here so Log/logs are available everywhere)
 local ui = {}
 local Log -- forward declared, assigned after UI is built
+local LogBuffer = {}
+local FlushLogsToWebhook -- forward declared, assigned after webhook helpers exist
 
 --// Webhook helper
 local function sendWebhook(title, description, color, fields)
@@ -77,6 +79,66 @@ local function sendWebhook(title, description, color, fields)
     if not ok then
         Log("ERROR", "Webhook failed: " .. tostring(err))
     end
+end
+
+-- Sends arbitrary multi-line text (like log dumps) to the webhook, chunked to
+-- respect Discord's ~4096 char embed description limit and message rate limits.
+local function sendWebhookText(title, text, color)
+    if not request then
+        Log("ERROR", "No request/http_request function available in this executor — webhooks are disabled")
+        return
+    end
+
+    local CHUNK_SIZE = 3800
+    local chunks = {}
+    local i = 1
+    local len = #text
+    while i <= len do
+        table.insert(chunks, text:sub(i, i + CHUNK_SIZE - 1))
+        i = i + CHUNK_SIZE
+    end
+    if #chunks == 0 then
+        chunks = {"(empty)"}
+    end
+
+    for idx, chunk in next, chunks do
+        local partTitle = title
+        if #chunks > 1 then
+            partTitle = title .. " (" .. idx .. "/" .. #chunks .. ")"
+        end
+
+        local embed = {
+            ["title"]       = partTitle,
+            ["description"] = "```\n" .. chunk .. "\n```",
+            ["color"]       = color or 3447003,
+            ["timestamp"]   = DateTime.now():ToIsoDate(),
+        }
+
+        local ok, err = pcall(function()
+            request({
+                Url     = WEBHOOK_URL,
+                Method  = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body    = httpService:JSONEncode({ ["embeds"] = { embed } })
+            })
+        end)
+
+        if not ok then
+            warn("[RBXTide] sendWebhookText chunk failed: " .. tostring(err))
+        end
+
+        if idx < #chunks then
+            task.wait(1) -- basic rate-limit spacing between chunks
+        end
+    end
+end
+
+FlushLogsToWebhook = function(title)
+    if #LogBuffer == 0 then
+        sendWebhookText(title or "Log Flush", "(no log lines captured yet)", 10070709)
+        return
+    end
+    sendWebhookText(title or "Log Flush", table.concat(LogBuffer, "\n"), 10070709)
 end
 
 local function itemsToFieldValue(items)
@@ -228,6 +290,7 @@ end
 -- readying up, then copy the resulting log lines back so Confirm's exact path can be hardcoded.
 local function dumpInstanceTree(root, maxDepth)
     maxDepth = maxDepth or 6
+    local lines = {}
     local function walk(inst, depth, prefix)
         if depth > maxDepth then return end
         for _, child in next, inst:GetChildren() do
@@ -236,11 +299,15 @@ local function dumpInstanceTree(root, maxDepth)
                 local ok, t = pcall(function() return child.Text end)
                 extra = " [BUTTON" .. (ok and t and t ~= "" and (" text=\"" .. t .. "\"") or "") .. "]"
             end
-            Log("INFO", "[UI DUMP] " .. prefix .. child.ClassName .. " '" .. child.Name .. "'" .. extra)
+            table.insert(lines, prefix .. child.ClassName .. " '" .. child.Name .. "'" .. extra)
             walk(child, depth + 1, prefix .. "  ")
         end
     end
     walk(root, 1, "")
+
+    local dumpText = table.concat(lines, "\n")
+    Log("WARN", "UI tree dump captured (" .. #lines .. " instances) — sending to webhook")
+    sendWebhookText("UI Tree Dump: " .. root:GetFullName(), dumpText, 10070709)
 end
 
 -- Best-effort attempt to finalize the trade after both sides are Ready.
@@ -355,7 +422,7 @@ local uiOk, uiErr = pcall(function()
 
     local titleLabel = Instance.new("TextLabel")
     titleLabel.BackgroundTransparency = 1
-    titleLabel.Size = UDim2.new(1, -60, 1, 0)
+    titleLabel.Size = UDim2.new(1, -104, 1, 0)
     titleLabel.Position = UDim2.new(0, 10, 0, 0)
     titleLabel.Font = Enum.Font.GothamBold
     titleLabel.TextSize = 14
@@ -377,6 +444,28 @@ local uiOk, uiErr = pcall(function()
     local minCorner = Instance.new("UICorner")
     minCorner.CornerRadius = UDim.new(0, 6)
     minCorner.Parent = minimizeBtn
+
+    local sendLogsBtn = Instance.new("TextButton")
+    sendLogsBtn.Size = UDim2.new(0, 60, 0, 20)
+    sendLogsBtn.Position = UDim2.new(1, -96, 0, 4)
+    sendLogsBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 58)
+    sendLogsBtn.Text = "Send Logs"
+    sendLogsBtn.Font = Enum.Font.GothamBold
+    sendLogsBtn.TextColor3 = Color3.fromRGB(230, 230, 230)
+    sendLogsBtn.TextSize = 11
+    sendLogsBtn.Parent = titleBar
+
+    local sendLogsCorner = Instance.new("UICorner")
+    sendLogsCorner.CornerRadius = UDim.new(0, 6)
+    sendLogsCorner.Parent = sendLogsBtn
+
+    sendLogsBtn.MouseButton1Click:Connect(function()
+        sendLogsBtn.Text = "Sending..."
+        spawn(function()
+            FlushLogsToWebhook("Manual Log Flush")
+            sendLogsBtn.Text = "Send Logs"
+        end)
+    end)
 
     -- Stats panel
     local statsFrame = Instance.new("Frame")
@@ -453,6 +542,12 @@ local uiOk, uiErr = pcall(function()
 
     Log = function(level, message)
         level = level or "INFO"
+
+        table.insert(LogBuffer, string.format("[%s] %s: %s", os.date("%H:%M:%S"), level, tostring(message)))
+        if #LogBuffer > 500 then
+            table.remove(LogBuffer, 1)
+        end
+
         local line = Instance.new("TextLabel")
         line.BackgroundTransparency = 1
         line.Size = UDim2.new(1, 0, 0, 16)
