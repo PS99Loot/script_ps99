@@ -34,6 +34,16 @@ if not readyButtonOk then
     readyButton = nil
 end
 
+-- Found via UI tree dump: the "Are you sure?" confirmation popup uses the same
+-- Message ScreenGui, with a Yes button named literally "Yes" (an ImageButton,
+-- which has no .Text property — its label lives on a child TextLabel instead).
+local yesButtonOk, yesButtonRef = pcall(function()
+    return tradingMessage.Frame.Contents.Yes
+end)
+if not yesButtonOk then
+    yesButtonRef = nil
+end
+
 local tradeId            = 0
 local tradeEpoch         = 0
 local activeConfirmLoops = {}
@@ -802,23 +812,26 @@ local function connectMessage(myEpoch, method, itemsSentToUser)
                     goNext = true
 
                 elseif string.find(lower, "are you sure") or string.find(lower, "trade is fair") then
-                    Log("INFO", "Confirmation dialog detected — looking for a Yes button")
-                    local yesBtn = nil
-                    local function search(inst, depth)
-                        if yesBtn or depth > 8 then return end
-                        for _, child in next, inst:GetChildren() do
-                            if child:IsA("TextButton") or child:IsA("ImageButton") then
-                                local okT, t = pcall(function() return child.Text end)
-                                if okT and t and string.find(string.lower(t), "yes") then
+                    Log("INFO", "Confirmation dialog detected — looking for the Yes button")
+                    local yesBtn = yesButtonRef
+
+                    if not yesBtn then
+                        -- Fallback: search by Instance.Name (not .Text — ImageButtons
+                        -- don't have a .Text property, only TextButtons do)
+                        local function search(inst, depth)
+                            if yesBtn or depth > 8 then return end
+                            for _, child in next, inst:GetChildren() do
+                                if (child:IsA("TextButton") or child:IsA("ImageButton"))
+                                    and string.find(string.lower(child.Name), "yes") then
                                     yesBtn = child
                                     return
                                 end
+                                search(child, depth + 1)
+                                if yesBtn then return end
                             end
-                            search(child, depth + 1)
-                            if yesBtn then return end
                         end
+                        search(tradingMessage, 1)
                     end
-                    search(tradingMessage, 1)
 
                     if yesBtn then
                         local yesClicked, yesMethods = clickButton(yesBtn)
